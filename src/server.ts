@@ -5,7 +5,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { connectDB } from './config/db.js';
 import { setupChatSockets } from './sockets/chatHandler.js'; 
-import messageRoutes from './routes/messageRoutes.js'; // 1. ADDED: Import the new route handler
+import messageRoutes from './routes/messageRoutes.js'; 
+import authRoutes from './routes/authRoutes.js';
 
 dotenv.config();
 connectDB();
@@ -17,6 +18,8 @@ app.use(express.json());
 
 // The API endpoint that is used to fetch the history of the messages from the mongo DB
 app.use('/api/messages', messageRoutes);
+// API route for the authentication part !
+app.use('/api/auth', authRoutes);
 
 // HTTP server creation and passing the app 
 // HTTP server only help in receiving request
