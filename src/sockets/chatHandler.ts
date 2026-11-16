@@ -1,11 +1,26 @@
-
 import { Server, Socket } from 'socket.io';
+import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken'; // ADDED: Import for JWT verification
 // This import helps to define the MongoDB message model
 import Message from '../models/Message.js'; 
+import Room from '../models/Room.js'; // ADDED: To verify room membership
 
 // ADDED: The same secret key used in authController
 const JWT_SECRET = process.env.JWT_SECRET || 'fleet_super_secret_key_2026';
+
+// ADDED: Helper to verify if a user is allowed to access a given room
+const canAccessRoom = async (roomId: string, userId: string): Promise<boolean> => {
+  if (!mongoose.Types.ObjectId.isValid(roomId)) return false;
+
+  const room = await Room.findById(roomId);
+  if (!room) return false;
+
+  // Anyone authenticated can access the shared community room
+  if (room.type === 'community') return true;
+
+  // For personal rooms, strictly allow only the assigned manager and driver
+  return room.participants.some((participantId) => participantId.toString() === userId);
+};
 
 // Server is the whole connection 
 // Socket is the individual connection
@@ -47,18 +62,34 @@ export const setupChatSockets = (io: Server) => {
     // Socket IDs can change after reconnection so this is not about the client id, or something like that we can use it as client id
 
     // This is the room allotment / management code !
-    socket.on('join_room', (data: { roomId: string, userId: string }) => {
+    socket.on('join_room', async (data: { roomId: string, userId: string }) => {
+      const authenticatedUserId = socket.data.user.userId;
+      const allowed = await canAccessRoom(data.roomId, authenticatedUserId);
+
+      if (!allowed) {
+        socket.emit('room_error', { error: 'Unauthorized room access' });
+        return;
+      }
+
       socket.join(data.roomId);
-      console.log(`User with id: ${data.userId} joined room wih id: ${data.roomId}`);
+      console.log(`User with id: ${authenticatedUserId} joined room wih id: ${data.roomId}`);
     });
 
     // This is the message handling code
     socket.on('send_message', async (data: { roomId: string, senderId: string, content: string }) => {
       try {
+        const authenticatedUserId = socket.data.user.userId;
+        const allowed = await canAccessRoom(data.roomId, authenticatedUserId);
+
+        if (!allowed) {
+          socket.emit('message_error', { error: 'Unauthorized room access' });
+          return;
+        }
+
         // Save the message to MongoDB first to ensure persistence
         const newMessage = await Message.create({
           roomId: data.roomId,
-          senderId: data.senderId,
+          senderId: authenticatedUserId,
           content: data.content,
         });
 

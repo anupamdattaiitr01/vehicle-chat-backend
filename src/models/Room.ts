@@ -10,4 +10,7 @@ const RoomSchema: Schema = new Schema({
   participants: [{ type: Schema.Types.ObjectId, ref: 'User' }]
 }, { timestamps: true });
 
+// ADDED: Compound index for fast room lookups by type and participants
+RoomSchema.index({ type: 1, participants: 1 });
+
 export default mongoose.model<IRoom>('Room', RoomSchema);

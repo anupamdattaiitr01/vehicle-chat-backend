@@ -1,38 +1,115 @@
 import { Request, Response } from 'express';
+import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import User from '../models/User.js'; // Ensure .js extension
+import CryptoJS from 'crypto-js'; // For payload decryption
+import User from '../models/User.js';
+import Room from '../models/Room.js'; // ADDED: To auto-create private rooms on registration
 
-// In production, this must come from your .env file
 const JWT_SECRET = process.env.JWT_SECRET || 'fleet_super_secret_key_2026';
+// Shared secret key for AES encryption (must match the frontend)
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'fleet_payload_secret_2026';
 
 export const registerUser = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { name, phone, password, role, managerId } = req.body;
+    // 1. Extract and decrypt the AES payload
+    const { data } = req.body;
 
-    // 1. Check if the phone number is already registered
-    const existingUser = await User.findOne({ phone });
-    if (existingUser) {
-      res.status(400).json({ error: 'Phone number is already registered' });
+    if (!data) {
+      res.status(400).json({ error: 'Missing encrypted payload' });
       return;
     }
 
-    // 2. Hash the password for security
+    const bytes = CryptoJS.AES.decrypt(data, ENCRYPTION_KEY);
+    const decryptedPayload = bytes.toString(CryptoJS.enc.Utf8);
+
+    if (!decryptedPayload) {
+      res.status(400).json({ error: 'Invalid encryption payload' });
+      return;
+    }
+
+    const { name, phone, password, role, managerId } = JSON.parse(decryptedPayload);
+
+    // 2. Validate required fields
+    if (!name || !phone || !password || !role) {
+      res.status(400).json({ error: 'Name, phone number, password, and role are required' });
+      return;
+    }
+
+    if (role !== 'manager' && role !== 'driver') {
+      res.status(400).json({ error: 'Role must be either manager or driver' });
+      return;
+    }
+
+    // 3. Cross-check if phone number already exists (same role OR opposite role)
+    const existingUser = await User.findOne({ phone: phone.trim() });
+    if (existingUser) {
+      if (existingUser.role !== role) {
+        const existingRoleLabel = existingUser.role === 'manager' ? 'Manager' : 'Driver';
+        const targetRoleLabel = role === 'manager' ? 'Manager' : 'Driver';
+        res.status(400).json({
+          error: `This phone number is already registered as a ${existingRoleLabel} and cannot be registered as a ${targetRoleLabel}.`
+        });
+        return;
+      }
+
+      res.status(400).json({ error: `This phone number is already registered as a ${role}.` });
+      return;
+    }
+
+    // 4. If registering a driver, verify they are assigned to exactly one valid manager
+    let validManagerId: mongoose.Types.ObjectId | undefined = undefined;
+    if (role === 'driver') {
+      if (!managerId || !mongoose.Types.ObjectId.isValid(managerId)) {
+        res.status(400).json({ error: 'Please select a valid manager before registering as a driver.' });
+        return;
+      }
+
+      const assignedManager = await User.findOne({ _id: managerId, role: 'manager' });
+      if (!assignedManager) {
+        res.status(400).json({ error: 'Assigned manager not found.' });
+        return;
+      }
+
+      validManagerId = assignedManager._id as mongoose.Types.ObjectId;
+    }
+
+    // 5. Hash the password for security
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // 3. Create the user
+    // 6. Create the user
     const newUser = await User.create({
-      name,
-      phone,
+      name: name.trim(),
+      phone: phone.trim(),
       password: hashedPassword,
       role,
-      managerId: role === 'driver' ? managerId : undefined,
+      managerId: validManagerId,
     });
 
-    res.status(201).json({ 
-      message: 'User registered successfully', 
-      userId: newUser._id 
+    // 7. Ensure shared Community Hub room exists in DB
+    let communityRoom = await Room.findOne({ type: 'community' });
+    if (!communityRoom) {
+      communityRoom = await Room.create({
+        type: 'community',
+        participants: [],
+      });
+    }
+
+    // 8. If a driver registered, automatically create their dedicated 1-on-1 room with their manager
+    let personalRoomId = null;
+    if (role === 'driver' && validManagerId) {
+      const personalRoom = await Room.create({
+        type: 'personal',
+        participants: [validManagerId, newUser._id],
+      });
+      personalRoomId = personalRoom._id;
+    }
+
+    res.status(201).json({
+      message: 'User registered successfully',
+      userId: newUser._id,
+      personalRoomId,
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -42,30 +119,45 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
 
 export const loginUser = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { phone, password } = req.body;
+    // 1. Extract the encrypted string from the request body
+    const { data } = req.body;
 
-    // 1. Find the user by their phone number
-    const user = await User.findOne({ phone });
+    if (!data) {
+      res.status(400).json({ error: 'Missing encrypted payload' });
+      return;
+    }
+
+    // 2. Decrypt the AES ciphertext back into a raw JSON string
+    const bytes = CryptoJS.AES.decrypt(data, ENCRYPTION_KEY);
+    const decryptedPayload = bytes.toString(CryptoJS.enc.Utf8);
+
+    if (!decryptedPayload) {
+      res.status(400).json({ error: 'Invalid encryption payload' });
+      return;
+    }
+
+    // 3. Parse the decrypted JSON string to extract the phone and password
+    const { phone, password } = JSON.parse(decryptedPayload);
+
+    // Proceed with normal login logic using the decrypted credentials
+    const user = await User.findOne({ phone: phone?.trim() });
     if (!user) {
       res.status(400).json({ error: 'Invalid phone number or password' });
       return;
     }
 
-    // 2. Compare the provided password with the hashed password in the database
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       res.status(400).json({ error: 'Invalid phone number or password' });
       return;
     }
 
-    // 3. Generate a JSON Web Token valid for 7 days
     const token = jwt.sign(
       { userId: user._id, role: user.role, name: user.name },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    // 4. Send the token and user data back to the React/Flutter app
     res.status(200).json({
       message: 'Login successful',
       token,
