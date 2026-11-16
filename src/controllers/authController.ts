@@ -174,3 +174,62 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
     res.status(500).json({ error: 'Failed to log in' });
   }
 };
+
+// ADDED: Save or refresh the device's FCM token for background/killed push notifications
+export const updateFcmToken = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Authorization token required' });
+      return;
+    }
+
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
+
+    const { fcmToken } = req.body;
+    if (!fcmToken || typeof fcmToken !== 'string') {
+      res.status(400).json({ error: 'Valid fcmToken is required' });
+      return;
+    }
+
+    // Detach this device token from any previous account (e.g., if drivers share a device)
+    await User.updateMany(
+      { _id: { $ne: decoded.userId }, fcmToken: fcmToken.trim() },
+      { $unset: { fcmToken: '' } }
+    );
+
+    // Bind the FCM token to the currently authenticated user
+    await User.findByIdAndUpdate(decoded.userId, {
+      fcmToken: fcmToken.trim(),
+    });
+
+    res.status(200).json({ message: 'FCM token updated successfully' });
+  } catch (error) {
+    console.error('Error updating FCM token:', error);
+    res.status(500).json({ error: 'Failed to update FCM token' });
+  }
+};
+
+// ADDED: Remove the device's FCM token on logout so logged-out devices do not receive alerts
+export const removeFcmToken = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Authorization token required' });
+      return;
+    }
+
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
+
+    await User.findByIdAndUpdate(decoded.userId, {
+      $unset: { fcmToken: '' },
+    });
+
+    res.status(200).json({ message: 'FCM token removed successfully' });
+  } catch (error) {
+    console.error('Error removing FCM token:', error);
+    res.status(500).json({ error: 'Failed to remove FCM token' });
+  }
+};

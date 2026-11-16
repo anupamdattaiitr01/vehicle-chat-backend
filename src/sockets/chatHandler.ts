@@ -4,6 +4,8 @@ import jwt from 'jsonwebtoken'; // ADDED: Import for JWT verification
 // This import helps to define the MongoDB message model
 import Message from '../models/Message.js'; 
 import Room from '../models/Room.js'; // ADDED: To verify room membership
+import User from '../models/User.js'; // ADDED: To look up recipient FCM tokens
+import { sendPushNotification } from '../config/firebase.js'; // ADDED: Push notification dispatcher
 
 // ADDED: The same secret key used in authController
 const JWT_SECRET = process.env.JWT_SECRET || 'fleet_super_secret_key_2026';
@@ -79,6 +81,7 @@ export const setupChatSockets = (io: Server) => {
     socket.on('send_message', async (data: { roomId: string, senderId: string, content: string }) => {
       try {
         const authenticatedUserId = socket.data.user.userId;
+        const senderName = socket.data.user.name || 'Fleet Alert';
         const allowed = await canAccessRoom(data.roomId, authenticatedUserId);
 
         if (!allowed) {
@@ -96,6 +99,59 @@ export const setupChatSockets = (io: Server) => {
         // Broadcast the saved message to EVERYONE in the room, including the sender
         // The frontend will listen for 'receive_message' to append it to the chat UI
         io.to(data.roomId).emit('receive_message', newMessage);
+
+        // ADDED: Dispatch FCM Push Notifications for drivers in background or killed app state
+        const room = await Room.findById(data.roomId);
+        if (room) {
+          if (room.type === 'personal') {
+            // Find the other participant (the assigned driver) in this 1-on-1 room
+            const recipientIds = room.participants.filter(
+              (id) => id.toString() !== authenticatedUserId
+            );
+
+            const recipients = await User.find({
+              _id: { $in: recipientIds },
+              fcmToken: { $exists: true, $ne: '' },
+            }).select('fcmToken');
+
+            const tokens = recipients
+              .map((u) => u.fcmToken)
+              .filter((t): t is string => Boolean(t));
+
+            await sendPushNotification({
+              tokens,
+              title: senderName,
+              body: data.content,
+              data: {
+                roomId: String(data.roomId),
+                roomType: 'personal',
+                senderName,
+              },
+            });
+          } else if (room.type === 'community') {
+            // Notify all drivers (excluding the sender) who have a registered FCM token
+            const drivers = await User.find({
+              role: 'driver',
+              _id: { $ne: authenticatedUserId },
+              fcmToken: { $exists: true, $ne: '' },
+            }).select('fcmToken');
+
+            const tokens = drivers
+              .map((d) => d.fcmToken)
+              .filter((t): t is string => Boolean(t));
+
+            await sendPushNotification({
+              tokens,
+              title: `Community Hub • ${senderName}`,
+              body: data.content,
+              data: {
+                roomId: String(data.roomId),
+                roomType: 'community',
+                senderName,
+              },
+            });
+          }
+        }
       } catch (error) {
         console.error('Error saving message:', error);
         socket.emit('message_error', { error: 'Failed to send message' });
