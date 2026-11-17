@@ -2,17 +2,15 @@ import { Request, Response } from 'express';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import CryptoJS from 'crypto-js'; // For payload decryption
+import CryptoJS from 'crypto-js';
 import User from '../models/User.js';
-import Room from '../models/Room.js'; // ADDED: To auto-create private rooms on registration
+import Room from '../models/Room.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fleet_super_secret_key_2026';
-// Shared secret key for AES encryption (must match the frontend)
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'fleet_payload_secret_2026';
 
 export const registerUser = async (req: Request, res: Response): Promise<void> => {
   try {
-    // 1. Extract and decrypt the AES payload
     const { data } = req.body;
 
     if (!data) {
@@ -30,7 +28,6 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
 
     const { name, phone, password, role, managerId } = JSON.parse(decryptedPayload);
 
-    // 2. Validate required fields
     if (!name || !phone || !password || !role) {
       res.status(400).json({ error: 'Name, phone number, password, and role are required' });
       return;
@@ -41,14 +38,13 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    // 3. Cross-check if phone number already exists (same role OR opposite role)
     const existingUser = await User.findOne({ phone: phone.trim() });
     if (existingUser) {
       if (existingUser.role !== role) {
         const existingRoleLabel = existingUser.role === 'manager' ? 'Manager' : 'Driver';
         const targetRoleLabel = role === 'manager' ? 'Manager' : 'Driver';
         res.status(400).json({
-          error: `This phone number is already registered as a ${existingRoleLabel} and cannot be registered as a ${targetRoleLabel}.`
+          error: `This phone number is already registered as a ${existingRoleLabel} and cannot be registered as a ${targetRoleLabel}.`,
         });
         return;
       }
@@ -57,7 +53,6 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    // 4. If registering a driver, verify they are assigned to exactly one valid manager
     let validManagerId: mongoose.Types.ObjectId | undefined = undefined;
     if (role === 'driver') {
       if (!managerId || !mongoose.Types.ObjectId.isValid(managerId)) {
@@ -74,11 +69,9 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
       validManagerId = assignedManager._id as mongoose.Types.ObjectId;
     }
 
-    // 5. Hash the password for security
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // 6. Create the user
     const newUser = await User.create({
       name: name.trim(),
       phone: phone.trim(),
@@ -87,7 +80,6 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
       managerId: validManagerId,
     });
 
-    // 7. Ensure shared Community Hub room exists in DB
     let communityRoom = await Room.findOne({ type: 'community' });
     if (!communityRoom) {
       communityRoom = await Room.create({
@@ -96,7 +88,6 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
       });
     }
 
-    // 8. If a driver registered, automatically create their dedicated 1-on-1 room with their manager
     let personalRoomId = null;
     if (role === 'driver' && validManagerId) {
       const personalRoom = await Room.create({
@@ -119,7 +110,6 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
 
 export const loginUser = async (req: Request, res: Response): Promise<void> => {
   try {
-    // 1. Extract the encrypted string from the request body
     const { data } = req.body;
 
     if (!data) {
@@ -127,7 +117,6 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // 2. Decrypt the AES ciphertext back into a raw JSON string
     const bytes = CryptoJS.AES.decrypt(data, ENCRYPTION_KEY);
     const decryptedPayload = bytes.toString(CryptoJS.enc.Utf8);
 
@@ -136,10 +125,8 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // 3. Parse the decrypted JSON string to extract the phone and password
     const { phone, password } = JSON.parse(decryptedPayload);
 
-    // Proceed with normal login logic using the decrypted credentials
     const user = await User.findOne({ phone: phone?.trim() });
     if (!user) {
       res.status(400).json({ error: 'Invalid phone number or password' });
@@ -167,7 +154,7 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
         role: user.role,
         phone: user.phone,
         managerId: user.managerId,
-      }
+      },
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -175,7 +162,6 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
   }
 };
 
-// ADDED: Save or refresh the device's FCM token for background/killed push notifications
 export const updateFcmToken = async (req: Request, res: Response): Promise<void> => {
   try {
     const authHeader = req.headers.authorization;
@@ -193,16 +179,20 @@ export const updateFcmToken = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Detach this device token from any previous account (e.g., if drivers share a device)
     await User.updateMany(
       { _id: { $ne: decoded.userId }, fcmToken: fcmToken.trim() },
       { $unset: { fcmToken: '' } }
     );
 
-    // Bind the FCM token to the currently authenticated user
-    await User.findByIdAndUpdate(decoded.userId, {
-      fcmToken: fcmToken.trim(),
-    });
+    const updatedUser = await User.findByIdAndUpdate(
+      decoded.userId,
+      { fcmToken: fcmToken.trim() },
+      { new: true }
+    );
+
+    console.log(
+      `[FCM Token] Saved for user ${updatedUser?.name || decoded.userId} (token present: ${Boolean(updatedUser?.fcmToken)})`
+    );
 
     res.status(200).json({ message: 'FCM token updated successfully' });
   } catch (error) {
@@ -211,7 +201,6 @@ export const updateFcmToken = async (req: Request, res: Response): Promise<void>
   }
 };
 
-// ADDED: Remove the device's FCM token on logout so logged-out devices do not receive alerts
 export const removeFcmToken = async (req: Request, res: Response): Promise<void> => {
   try {
     const authHeader = req.headers.authorization;
@@ -226,6 +215,8 @@ export const removeFcmToken = async (req: Request, res: Response): Promise<void>
     await User.findByIdAndUpdate(decoded.userId, {
       $unset: { fcmToken: '' },
     });
+
+    console.log(`[FCM Token] Removed for user ${decoded.userId}`);
 
     res.status(200).json({ message: 'FCM token removed successfully' });
   } catch (error) {

@@ -1,16 +1,14 @@
 import { Server, Socket } from 'socket.io';
 import mongoose from 'mongoose';
-import jwt from 'jsonwebtoken'; // ADDED: Import for JWT verification
-// This import helps to define the MongoDB message model
-import Message from '../models/Message.js'; 
-import Room from '../models/Room.js'; // ADDED: To verify room membership
-import User from '../models/User.js'; // ADDED: To look up recipient FCM tokens
-import { sendPushNotification } from '../config/firebase.js'; // ADDED: Push notification dispatcher
+import jwt from 'jsonwebtoken';
+import Message from '../models/Message.js';
+import Room from '../models/Room.js';
+import User from '../models/User.js';
+import { sendPushNotification } from '../config/firebase.js';
 
-// ADDED: The same secret key used in authController
 const JWT_SECRET = process.env.JWT_SECRET || 'fleet_super_secret_key_2026';
 
-// ADDED: Helper to verify if a user is allowed to access a given room
+// Helper to verify if a user is allowed to access a given room
 const canAccessRoom = async (roomId: string, userId: string): Promise<boolean> => {
   if (!mongoose.Types.ObjectId.isValid(roomId)) return false;
 
@@ -24,19 +22,9 @@ const canAccessRoom = async (roomId: string, userId: string): Promise<boolean> =
   return room.participants.some((participantId) => participantId.toString() === userId);
 };
 
-// Server is the whole connection 
-// Socket is the individual connection
-
-// The Socket io server connection manages all the connected clients and their communication
-// And the socket represent individual client connection
-// Each connection has its own socket id
-
 export const setupChatSockets = (io: Server) => {
-  
-  // ADDED: Socket Authentication Middleware
-  // This intercepts the connection request before establishing the socket
+  // Socket Authentication Middleware
   io.use((socket, next) => {
-    // The frontend will send the token inside the handshake auth object
     const token = socket.handshake.auth.token;
 
     if (!token) {
@@ -44,45 +32,70 @@ export const setupChatSockets = (io: Server) => {
     }
 
     try {
-      // Verify the token is valid and hasn't expired
       const decoded = jwt.verify(token, JWT_SECRET);
-      
-      // Attach the decoded user payload to the socket session for future use
-      socket.data.user = decoded; 
-      
-      next(); // Token is valid, allow connection!
+      socket.data.user = decoded;
+      next();
     } catch (err) {
       return next(new Error('Authentication error: Invalid or expired token'));
     }
   });
 
-  // This statement is executed mutiple times, when ever the a new user connects to the server
-  // Each connection has its own socket id
-  io.on('connection', (socket: Socket) => {
-    console.log(`User connected to socket: ${socket.id} (Authenticated as: ${socket.data.user.name})`); // UPDATED: Log the real user name
-    // IMP // 
-    // Socket IDs can change after reconnection so this is not about the client id, or something like that we can use it as client id
+  io.on('connection', async (socket: Socket) => {
+    const connectedUserId = String(socket.data.user.userId);
+    const connectedRole = socket.data.user.role;
 
-    // This is the room allotment / management code !
-    socket.on('join_room', async (data: { roomId: string, userId: string }) => {
-      const authenticatedUserId = socket.data.user.userId;
-      const allowed = await canAccessRoom(data.roomId, authenticatedUserId);
+    // Close any stale zombie sockets for the same driver so ghost sockets never block FCM pushes
+    if (connectedRole === 'driver') {
+      const existingSockets = await io.fetchSockets();
+      for (const s of existingSockets) {
+        if (s.id !== socket.id && String(s.data.user?.userId) === connectedUserId) {
+          console.log(`Disconnecting stale driver socket: ${s.id}`);
+          s.disconnect(true);
+        }
+      }
+    }
+
+    console.log(`User connected to socket: ${socket.id} (Authenticated as: ${socket.data.user.name})`);
+
+    // Room allotment / management
+    socket.on('join_room', async (data: { roomId: string; userId: string }) => {
+      const authenticatedUserId = String(socket.data.user.userId);
+      const roomId = String(data.roomId);
+      const allowed = await canAccessRoom(roomId, authenticatedUserId);
 
       if (!allowed) {
         socket.emit('room_error', { error: 'Unauthorized room access' });
         return;
       }
 
-      socket.join(data.roomId);
-      console.log(`User with id: ${authenticatedUserId} joined room wih id: ${data.roomId}`);
+      // Drivers only view one tab at a time—ensure they leave any previous room first
+      if (socket.data.user.role === 'driver') {
+        for (const existingRoom of socket.rooms) {
+          if (existingRoom !== socket.id && existingRoom !== roomId) {
+            socket.leave(existingRoom);
+          }
+        }
+      }
+
+      socket.join(roomId);
+      console.log(`User with id: ${authenticatedUserId} joined room with id: ${roomId}`);
     });
 
-    // This is the message handling code
-    socket.on('send_message', async (data: { roomId: string, senderId: string, content: string }) => {
+    // Leave room when user switches tabs or backgrounds the mobile app
+    socket.on('leave_room', (data: { roomId: string; userId?: string }) => {
+      if (!data?.roomId) return;
+      const roomId = String(data.roomId);
+      socket.leave(roomId);
+      console.log(`User with id: ${socket.data.user.userId} left room with id: ${roomId}`);
+    });
+
+    // Message handling + FCM dispatch
+    socket.on('send_message', async (data: { roomId: string; senderId: string; content: string }) => {
       try {
-        const authenticatedUserId = socket.data.user.userId;
+        const authenticatedUserId = String(socket.data.user.userId);
         const senderName = socket.data.user.name || 'Fleet Alert';
-        const allowed = await canAccessRoom(data.roomId, authenticatedUserId);
+        const roomId = String(data.roomId);
+        const allowed = await canAccessRoom(roomId, authenticatedUserId);
 
         if (!allowed) {
           socket.emit('message_error', { error: 'Unauthorized room access' });
@@ -91,61 +104,90 @@ export const setupChatSockets = (io: Server) => {
 
         // Save the message to MongoDB first to ensure persistence
         const newMessage = await Message.create({
-          roomId: data.roomId,
+          roomId,
           senderId: authenticatedUserId,
           content: data.content,
         });
 
-        // Broadcast the saved message to EVERYONE in the room, including the sender
-        // The frontend will listen for 'receive_message' to append it to the chat UI
-        io.to(data.roomId).emit('receive_message', newMessage);
+        // Broadcast the saved message to everyone currently viewing this room
+        io.to(roomId).emit('receive_message', newMessage);
 
-        // ADDED: Dispatch FCM Push Notifications for drivers in background or killed app state
-        const room = await Room.findById(data.roomId);
-        if (room) {
-          if (room.type === 'personal') {
-            // Find the other participant (the assigned driver) in this 1-on-1 room
-            const recipientIds = room.participants.filter(
-              (id) => id.toString() !== authenticatedUserId
-            );
+        // Check which users are actively viewing THIS exact room right now
+        const activeSocketsInRoom = await io.in(roomId).fetchSockets();
+        const activeUserIdsInRoom = new Set(
+          activeSocketsInRoom.map((s) => String(s.data.user?.userId))
+        );
 
+        // Dispatch FCM Push Notifications for drivers on another tab, in background, or offline
+        const room = await Room.findById(roomId);
+        if (!room) {
+          console.warn(`[FCM] Room ${roomId} not found in DB.`);
+          return;
+        }
+
+        if (room.type === 'personal') {
+          const recipientIds = room.participants
+            .map((id) => id.toString())
+            .filter((id) => id !== authenticatedUserId && !activeUserIdsInRoom.has(id));
+
+          console.log(
+            `[FCM Personal] Room ${roomId} | Active in room: [${Array.from(activeUserIdsInRoom).join(', ')}] | Target recipients: [${recipientIds.join(', ')}]`
+          );
+
+          if (recipientIds.length > 0) {
             const recipients = await User.find({
               _id: { $in: recipientIds },
               fcmToken: { $exists: true, $ne: '' },
-            }).select('fcmToken');
+            }).select('name fcmToken');
 
             const tokens = recipients
               .map((u) => u.fcmToken)
               .filter((t): t is string => Boolean(t));
 
-            await sendPushNotification({
-              tokens,
-              title: senderName,
-              body: data.content,
-              data: {
-                roomId: String(data.roomId),
-                roomType: 'personal',
-                senderName,
-              },
-            });
-          } else if (room.type === 'community') {
-            // Notify all drivers (excluding the sender) who have a registered FCM token
-            const drivers = await User.find({
-              role: 'driver',
-              _id: { $ne: authenticatedUserId },
-              fcmToken: { $exists: true, $ne: '' },
-            }).select('fcmToken');
+            console.log(
+              `[FCM Personal] Found ${tokens.length}/${recipientIds.length} recipient(s) with saved fcmToken`
+            );
 
-            const tokens = drivers
-              .map((d) => d.fcmToken)
-              .filter((t): t is string => Boolean(t));
+            if (tokens.length > 0) {
+              await sendPushNotification({
+                tokens,
+                title: senderName,
+                body: data.content,
+                data: {
+                  roomId,
+                  roomType: 'personal',
+                  senderName,
+                },
+              });
+            }
+          }
+        } else if (room.type === 'community') {
+          const excludedIds = [
+            authenticatedUserId,
+            ...Array.from(activeUserIdsInRoom),
+          ];
 
+          const drivers = await User.find({
+            role: 'driver',
+            _id: { $nin: excludedIds },
+            fcmToken: { $exists: true, $ne: '' },
+          }).select('name fcmToken');
+
+          const tokens = drivers
+            .map((d) => d.fcmToken)
+            .filter((t): t is string => Boolean(t));
+
+          console.log(
+            `[FCM Community] Room ${roomId} | Excluded active IDs: [${excludedIds.join(', ')}] | Drivers with fcmToken: ${tokens.length}`
+          );
+
+          if (tokens.length > 0) {
             await sendPushNotification({
               tokens,
               title: `Community Hub • ${senderName}`,
               body: data.content,
               data: {
-                roomId: String(data.roomId),
+                roomId,
                 roomType: 'community',
                 senderName,
               },
@@ -158,14 +200,13 @@ export const setupChatSockets = (io: Server) => {
       }
     });
 
-    // This is the code that handles the typing 
-    socket.on('typing', (data: { roomId: string, userName: string }) => {
-      // socket.to() broadcasts to everyone in the room EXCEPT the person typing
-      socket.to(data.roomId).emit('display_typing', { userName: data.userName, isTyping: true });
+    // Typing indicators
+    socket.on('typing', (data: { roomId: string; userName: string }) => {
+      socket.to(String(data.roomId)).emit('display_typing', { userName: data.userName, isTyping: true });
     });
 
     socket.on('stop_typing', (data: { roomId: string }) => {
-      socket.to(data.roomId).emit('display_typing', { isTyping: false });
+      socket.to(String(data.roomId)).emit('display_typing', { isTyping: false });
     });
 
     socket.on('disconnect', () => {
@@ -173,7 +214,6 @@ export const setupChatSockets = (io: Server) => {
     });
   });
 };
-
 
 // import { Server, Socket } from 'socket.io';
 // // This import helps to define the MongoDB message model

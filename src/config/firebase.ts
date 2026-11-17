@@ -45,7 +45,15 @@ export const sendPushNotification = async ({
   body,
   data,
 }: PushPayload): Promise<void> => {
-  if (!isFirebaseInitialized || tokens.length === 0) return;
+  if (!isFirebaseInitialized) {
+    console.warn('[FCM] Push skipped: Firebase Admin SDK is not initialized.');
+    return;
+  }
+
+  if (tokens.length === 0) {
+    console.warn('[FCM] Push skipped: No recipient FCM tokens provided.');
+    return;
+  }
 
   // Deduplicate and filter empty tokens
   const validTokens = Array.from(new Set(tokens.filter((t) => Boolean(t && t.trim()))));
@@ -64,7 +72,8 @@ export const sendPushNotification = async ({
         notification: {
           channelId: 'fleet_chat_messages',
           sound: 'default',
-          priority: 'high',
+          priority: 'max',
+          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
         },
       },
       apns: {
@@ -77,12 +86,17 @@ export const sendPushNotification = async ({
       },
     });
 
-    // Clean up stale/uninstalled FCM tokens automatically
+    console.log(
+      `[FCM] Dispatch complete: ${response.successCount} succeeded, ${response.failureCount} failed`
+    );
+
+    // Log errors and clean up stale/uninstalled FCM tokens automatically
     if (response.failureCount > 0) {
       const invalidTokens: string[] = [];
       response.responses.forEach((resp, idx) => {
         if (!resp.success) {
           const code = resp.error?.code;
+          console.error(`[FCM] Delivery error for token[${idx}]:`, code, resp.error?.message);
           if (
             code === 'messaging/invalid-registration-token' ||
             code === 'messaging/registration-token-not-registered'
