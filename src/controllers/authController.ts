@@ -1,5 +1,4 @@
 import { Request, Response } from 'express';
-import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import CryptoJS from 'crypto-js';
@@ -26,85 +25,63 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    const { name, phone, password, role, managerId } = JSON.parse(decryptedPayload);
+    const { name, phone, password, role } = JSON.parse(decryptedPayload);
 
-    if (!name || !phone || !password || !role) {
-      res.status(400).json({ error: 'Name, phone number, password, and role are required' });
+    if (!name || !phone || !password) {
+      res.status(400).json({ error: 'Name, phone number, and password are required' });
       return;
     }
 
-    if (role !== 'manager' && role !== 'driver') {
-      res.status(400).json({ error: 'Role must be either manager or driver' });
+    // Block driver self-registration; only managers may register publicly
+    if (role && role !== 'manager') {
+      res.status(403).json({
+        error: 'Driver self-registration is disabled. Please ask your fleet manager to add your account.',
+      });
       return;
     }
 
-    const existingUser = await User.findOne({ phone: phone.trim() });
+    const normalizedPhone = phone.trim();
+    const existingUser = await User.findOne({ phone: normalizedPhone });
     if (existingUser) {
-      if (existingUser.role !== role) {
-        const existingRoleLabel = existingUser.role === 'manager' ? 'Manager' : 'Driver';
-        const targetRoleLabel = role === 'manager' ? 'Manager' : 'Driver';
-        res.status(400).json({
-          error: `This phone number is already registered as a ${existingRoleLabel} and cannot be registered as a ${targetRoleLabel}.`,
+      if (existingUser.role === 'driver') {
+        res.status(409).json({
+          error: 'This phone number is already registered as a Driver account.',
         });
         return;
       }
 
-      res.status(400).json({ error: `This phone number is already registered as a ${role}.` });
+      res.status(409).json({
+        error: 'This phone number is already registered as a Manager.',
+      });
       return;
     }
 
-    let validManagerId: mongoose.Types.ObjectId | undefined = undefined;
-    if (role === 'driver') {
-      if (!managerId || !mongoose.Types.ObjectId.isValid(managerId)) {
-        res.status(400).json({ error: 'Please select a valid manager before registering as a driver.' });
-        return;
-      }
-
-      const assignedManager = await User.findOne({ _id: managerId, role: 'manager' });
-      if (!assignedManager) {
-        res.status(400).json({ error: 'Assigned manager not found.' });
-        return;
-      }
-
-      validManagerId = assignedManager._id as mongoose.Types.ObjectId;
-    }
-
     const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
+    const hashedPassword = await bcrypt.hash(password.trim(), salt);
 
-    const newUser = await User.create({
+    const newManager = await User.create({
       name: name.trim(),
-      phone: phone.trim(),
+      phone: normalizedPhone,
       password: hashedPassword,
-      role,
-      managerId: validManagerId,
+      role: 'manager',
     });
 
-    let communityRoom = await Room.findOne({ type: 'community' });
+    // Ensure shared Community Hub room exists
+    const communityRoom = await Room.findOne({ type: 'community' });
     if (!communityRoom) {
-      communityRoom = await Room.create({
+      await Room.create({
         type: 'community',
         participants: [],
       });
     }
 
-    let personalRoomId = null;
-    if (role === 'driver' && validManagerId) {
-      const personalRoom = await Room.create({
-        type: 'personal',
-        participants: [validManagerId, newUser._id],
-      });
-      personalRoomId = personalRoom._id;
-    }
-
     res.status(201).json({
-      message: 'User registered successfully',
-      userId: newUser._id,
-      personalRoomId,
+      message: 'Manager account created successfully. Please log in.',
+      userId: newManager._id,
     });
   } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ error: 'Failed to register user' });
+    console.error('Manager registration error:', error);
+    res.status(500).json({ error: 'Failed to register manager account' });
   }
 };
 
