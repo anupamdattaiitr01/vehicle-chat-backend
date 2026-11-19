@@ -117,3 +117,55 @@ export const sendPushNotification = async ({
     console.error('Error dispatching FCM push notification:', error);
   }
 };
+
+/**
+ * High-priority data-only FCM push for ride assignments.
+ * Omitting the top-level `notification` object ensures Android invokes
+ * Flutter's background isolate even when the app is terminated so a
+ * Full-Screen Intent booking card can wake the screen.
+ */
+export const sendBookingAlertPush = async ({
+  token,
+  data,
+}: {
+  token: string;
+  data: Record<string, string>;
+}): Promise<void> => {
+  if (!isFirebaseInitialized || !token || !token.trim()) {
+    console.warn('[FCM Booking] Push skipped: SDK uninitialized or missing driver token.');
+    return;
+  }
+
+  try {
+    const messageId = await getMessaging().send({
+      token: token.trim(),
+      data,
+      android: {
+        priority: 'high',
+        ttl: 60 * 1000, // 60 seconds urgency window
+      },
+      apns: {
+        headers: {
+          'apns-priority': '10',
+        },
+        payload: {
+          aps: {
+            contentAvailable: true,
+            sound: 'default',
+          },
+        },
+      },
+    });
+
+    console.log(`[FCM Booking] High-priority booking alert sent: ${messageId}`);
+  } catch (error: unknown) {
+    const err = error as { code?: string; message?: string };
+    console.error('[FCM Booking] Failed to send booking alert:', err.code, err.message);
+    if (
+      err.code === 'messaging/invalid-registration-token' ||
+      err.code === 'messaging/registration-token-not-registered'
+    ) {
+      await User.updateOne({ fcmToken: token.trim() }, { $unset: { fcmToken: '' } });
+    }
+  }
+};

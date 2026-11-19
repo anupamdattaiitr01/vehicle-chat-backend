@@ -55,6 +55,9 @@ export const setupChatSockets = (io: Server) => {
       }
     }
 
+    // Join personal user channel for direct ride assignments & status updates
+    socket.join(`user:${connectedUserId}`);
+
     console.log(`User connected to socket: ${socket.id} (Authenticated as: ${socket.data.user.name})`);
 
     // Room allotment / management
@@ -71,7 +74,11 @@ export const setupChatSockets = (io: Server) => {
       // Drivers only view one tab at a time—ensure they leave any previous room first
       if (socket.data.user.role === 'driver') {
         for (const existingRoom of socket.rooms) {
-          if (existingRoom !== socket.id && existingRoom !== roomId) {
+          if (
+            existingRoom !== socket.id &&
+            existingRoom !== roomId &&
+            !existingRoom.startsWith('user:')
+          ) {
             socket.leave(existingRoom);
           }
         }
@@ -214,6 +221,9 @@ export const setupChatSockets = (io: Server) => {
     });
   });
 };
+
+
+
 
 // import { Server, Socket } from 'socket.io';
 // // This import helps to define the MongoDB message model

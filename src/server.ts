@@ -8,13 +8,14 @@ import { setupChatSockets } from './sockets/chatHandler.js';
 import messageRoutes from './routes/messageRoutes.js'; 
 import authRoutes from './routes/authRoutes.js';
 import roomRoutes from './routes/roomRoutes.js'; // ADDED: Dynamic room and manager discovery routes
+import bookingRoutes from './routes/bookingRoutes.js'; // ADDED: Ride booking assignment & response routes
 
 dotenv.config();
 connectDB();
 
 const app: Application = express();
 
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] }));
 app.use(express.json());
 
 // The API endpoint that is used to fetch the history of the messages from the mongo DB
@@ -23,6 +24,8 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/auth', authRoutes);
 // ADDED: API route for fetching managers and dynamic private/community rooms
 app.use('/api/rooms', roomRoutes);
+// ADDED: API route for assigning bookings and handling driver confirmations/queries
+app.use('/api/bookings', bookingRoutes);
 
 // HTTP server creation and passing the app 
 // HTTP server only help in receiving request
@@ -36,6 +39,9 @@ const io = new Server(httpServer, {
   // This helps to allow only allowed origin and certain methods during handshake 
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
+
+// Expose Socket.io instance to Express routes for real-time booking & query broadcasts
+app.set('io', io);
 
 // Pass the io instance to your modular handler
 // This is the chat event handler
