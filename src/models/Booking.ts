@@ -1,6 +1,6 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
-export type BookingStatus = 'pending' | 'confirmed' | 'query_raised';
+export type BookingStatus = 'pending' | 'confirmed' | 'query_raised' | 'cancelled';
 
 export interface IBooking extends Document {
   managerId: mongoose.Types.ObjectId;
@@ -11,6 +11,9 @@ export interface IBooking extends Document {
   pickupLocation: string;
   dropLocation: string;
   scheduledTime: string;
+  scheduledAt: Date;
+  estimatedEndAt: Date;
+  durationMinutes: number;
   notes?: string;
   status: BookingStatus;
   queryMessage?: string;
@@ -62,6 +65,22 @@ const BookingSchema = new Schema<IBooking>(
       required: true,
       trim: true,
     },
+    scheduledAt: {
+      type: Date,
+      required: true,
+      index: true,
+    },
+    estimatedEndAt: {
+      type: Date,
+      required: true,
+    },
+    durationMinutes: {
+      type: Number,
+      required: true,
+      default: 60,
+      min: 15,
+      max: 720,
+    },
     notes: {
       type: String,
       required: false,
@@ -69,7 +88,7 @@ const BookingSchema = new Schema<IBooking>(
     },
     status: {
       type: String,
-      enum: ['pending', 'confirmed', 'query_raised'],
+      enum: ['pending', 'confirmed', 'query_raised', 'cancelled'],
       default: 'pending',
     },
     queryMessage: {
@@ -81,7 +100,7 @@ const BookingSchema = new Schema<IBooking>(
   { timestamps: true }
 );
 
-BookingSchema.index({ driverId: 1, createdAt: -1 });
-BookingSchema.index({ managerId: 1, createdAt: -1 });
+BookingSchema.index({ driverId: 1, status: 1, scheduledAt: 1 });
+BookingSchema.index({ managerId: 1, scheduledAt: 1 });
 
 export default mongoose.model<IBooking>('Booking', BookingSchema);

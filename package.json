@@ -6,7 +6,8 @@
     "dev": "nodemon --watch src --ext ts --exec tsx src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "db:seed": "tsx src/scripts/seed.ts"
+    "db:seed": "tsx src/scripts/seed.ts",
+    "db:clean-bookings": "tsx src/scripts/cleanTestBookings.ts"
   },
   "keywords": [],
   "dependencies": {

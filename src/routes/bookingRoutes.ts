@@ -21,7 +21,6 @@ interface AuthenticatedRequest extends Request {
   user?: AuthenticatedUser;
 }
 
-// Inline JWT Verification Middleware matching chatHandler.ts
 const verifyToken = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -39,7 +38,29 @@ const verifyToken = (req: AuthenticatedRequest, res: Response, next: NextFunctio
   }
 };
 
-// 1. Manager assigns a ride booking to a driver
+function formatDisplaySchedule(date: Date, durationMinutes: number): string {
+  const datePart = date.toLocaleDateString('en-IN', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+  const timePart = date.toLocaleTimeString('en-IN', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+  const hrs = durationMinutes / 60;
+  const durationLabel =
+    durationMinutes < 60
+      ? `${durationMinutes} mins`
+      : Number.isInteger(hrs)
+      ? `${hrs} hr${hrs > 1 ? 's' : ''}`
+      : `${hrs.toFixed(1)} hrs`;
+
+  return `${datePart}, ${timePart} (${durationLabel})`;
+}
+
+// 1. Manager assigns a ride booking to a driver (future-only & zero cross-timing)
 router.post('/', verifyToken, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     if (req.user?.role !== 'manager') {
@@ -55,7 +76,9 @@ router.post('/', verifyToken, async (req: AuthenticatedRequest, res: Response): 
       passengerPhone,
       pickupLocation,
       dropLocation,
+      scheduledAt,
       scheduledTime,
+      durationMinutes,
       notes,
     } = req.body;
 
@@ -65,11 +88,16 @@ router.post('/', verifyToken, async (req: AuthenticatedRequest, res: Response): 
       !passengerPhone?.trim() ||
       !pickupLocation?.trim() ||
       !dropLocation?.trim() ||
-      !scheduledTime?.trim()
+      !scheduledAt
     ) {
       res.status(400).json({
-        error: 'Driver, passenger details, pickup/drop locations, and scheduled time are required.',
+        error: 'Driver, passenger details, pickup/drop locations, and pickup date & time are required.',
       });
+      return;
+    }
+
+    if (!/^\d{10}$/.test(String(passengerPhone).trim())) {
+      res.status(400).json({ error: 'Passenger phone number must be exactly 10 digits.' });
       return;
     }
 
@@ -78,7 +106,25 @@ router.post('/', verifyToken, async (req: AuthenticatedRequest, res: Response): 
       return;
     }
 
-    // Verify driver exists and belongs to this manager
+    const parsedStart = new Date(scheduledAt);
+    if (Number.isNaN(parsedStart.getTime())) {
+      res.status(400).json({ error: 'Invalid pickup date and time format.' });
+      return;
+    }
+
+    if (parsedStart.getTime() < Date.now() - 60_000) {
+      res.status(400).json({
+        error: 'Pickup date and time cannot be in the past. Please select present or future time.',
+      });
+      return;
+    }
+
+    const parsedDuration = Math.min(
+      720,
+      Math.max(15, Number(durationMinutes) || 60)
+    );
+    const parsedEnd = new Date(parsedStart.getTime() + parsedDuration * 60_000);
+
     const driver = await User.findOne({
       _id: driverId,
       role: 'driver',
@@ -90,7 +136,21 @@ router.post('/', verifyToken, async (req: AuthenticatedRequest, res: Response): 
       return;
     }
 
-    // Find or create the personal room between this manager and driver
+    // Prevent cross-timing with any non-cancelled upcoming ride
+    const conflictingBooking = await Booking.findOne({
+      driverId: driver._id,
+      status: { $in: ['pending', 'confirmed', 'query_raised'] },
+      scheduledAt: { $lt: parsedEnd },
+      estimatedEndAt: { $gt: parsedStart },
+    }).sort({ scheduledAt: 1 });
+
+    if (conflictingBooking) {
+      res.status(409).json({
+        error: `Schedule conflict: ${driver.name} already has a ride for ${conflictingBooking.passengerName} at ${conflictingBooking.scheduledTime}.`,
+      });
+      return;
+    }
+
     let personalRoom = await Room.findOne({
       type: 'personal',
       participants: { $all: [managerId, driver._id] },
@@ -103,15 +163,23 @@ router.post('/', verifyToken, async (req: AuthenticatedRequest, res: Response): 
       });
     }
 
+    const displaySchedule =
+      typeof scheduledTime === 'string' && scheduledTime.trim().length > 0
+        ? scheduledTime.trim()
+        : formatDisplaySchedule(parsedStart, parsedDuration);
+
     const booking = await Booking.create({
       managerId,
       driverId: driver._id,
       roomId: personalRoom._id,
       passengerName: passengerName.trim(),
-      passengerPhone: passengerPhone.trim(),
+      passengerPhone: String(passengerPhone).trim(),
       pickupLocation: pickupLocation.trim(),
       dropLocation: dropLocation.trim(),
-      scheduledTime: scheduledTime.trim(),
+      scheduledTime: displaySchedule,
+      scheduledAt: parsedStart,
+      estimatedEndAt: parsedEnd,
+      durationMinutes: parsedDuration,
       notes: notes?.trim() || '',
       status: 'pending',
     });
@@ -128,19 +196,20 @@ router.post('/', verifyToken, async (req: AuthenticatedRequest, res: Response): 
       pickupLocation: booking.pickupLocation,
       dropLocation: booking.dropLocation,
       scheduledTime: booking.scheduledTime,
+      scheduledAt: booking.scheduledAt.toISOString(),
+      estimatedEndAt: booking.estimatedEndAt.toISOString(),
+      durationMinutes: booking.durationMinutes,
       notes: booking.notes || '',
       status: booking.status,
       queryMessage: booking.queryMessage || '',
       createdAt: booking.createdAt.toISOString(),
     };
 
-    // Emit live Socket.io event to the driver if currently connected
     const io = req.app.get('io') as Server | undefined;
     if (io) {
       io.to(`user:${driver._id}`).emit('booking_assigned', bookingPayload);
     }
 
-    // Send high-priority data-only FCM push so terminated/locked Android phones wake up
     if (driver.fcmToken) {
       await sendBookingAlertPush({
         token: driver.fcmToken,
@@ -156,6 +225,9 @@ router.post('/', verifyToken, async (req: AuthenticatedRequest, res: Response): 
           pickupLocation: bookingPayload.pickupLocation,
           dropLocation: bookingPayload.dropLocation,
           scheduledTime: bookingPayload.scheduledTime,
+          scheduledAt: bookingPayload.scheduledAt,
+          estimatedEndAt: bookingPayload.estimatedEndAt,
+          durationMinutes: String(bookingPayload.durationMinutes),
           notes: bookingPayload.notes,
           status: bookingPayload.status,
           createdAt: bookingPayload.createdAt,
@@ -170,17 +242,23 @@ router.post('/', verifyToken, async (req: AuthenticatedRequest, res: Response): 
   }
 });
 
-// 2. Fetch bookings for the logged-in driver or manager
+// 2. Fetch ONLY upcoming non-cancelled bookings sorted in ASCENDING order
 router.get('/my-bookings', verifyToken, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = String(req.user?.userId);
     const role = req.user?.role;
+    const now = new Date();
 
-    const filter = role === 'manager' ? { managerId: userId } : { driverId: userId };
+    const ownerFilter = role === 'manager' ? { managerId: userId } : { driverId: userId };
 
-    const bookings = await Booking.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(30)
+    const bookings = await Booking.find({
+      ...ownerFilter,
+      status: { $ne: 'cancelled' },
+      scheduledAt: { $exists: true },
+      estimatedEndAt: { $gte: now },
+    })
+      .sort({ scheduledAt: 1 })
+      .limit(50)
       .populate('managerId', 'name')
       .populate('driverId', 'name');
 
@@ -200,6 +278,9 @@ router.get('/my-bookings', verifyToken, async (req: AuthenticatedRequest, res: R
         pickupLocation: b.pickupLocation,
         dropLocation: b.dropLocation,
         scheduledTime: b.scheduledTime,
+        scheduledAt: b.scheduledAt.toISOString(),
+        estimatedEndAt: b.estimatedEndAt.toISOString(),
+        durationMinutes: b.durationMinutes || 60,
         notes: b.notes || '',
         status: b.status,
         queryMessage: b.queryMessage || '',
@@ -214,7 +295,7 @@ router.get('/my-bookings', verifyToken, async (req: AuthenticatedRequest, res: R
   }
 });
 
-// 3. Driver confirms booking or raises a query (auto-posts query to personal chat room)
+// 3. Driver confirms booking or raises a query (allowed even after confirmation)
 router.patch(
   '/:bookingId/respond',
   verifyToken,
@@ -255,6 +336,12 @@ router.patch(
         return;
       }
 
+      if (booking.status === 'cancelled') {
+        res.status(400).json({ error: 'This ride has been cancelled by your manager.' });
+        return;
+      }
+
+      const wasConfirmed = booking.status === 'confirmed';
       const io = req.app.get('io') as Server | undefined;
       let createdChatMessage = null;
 
@@ -267,14 +354,14 @@ router.patch(
         booking.queryMessage = cleanQuery;
         await booking.save();
 
-        // Automatically post the driver's query into their personal Manager chat room
-        const formattedChatContent =
-          `📋 Booking Query (${booking.passengerName} • ${booking.scheduledTime}):\n${cleanQuery}`;
+        const prefix = wasConfirmed
+          ? `📋 Post-Confirmation Query (${booking.passengerName} • ${booking.scheduledTime}):`
+          : `📋 Booking Query (${booking.passengerName} • ${booking.scheduledTime}):`;
 
         createdChatMessage = await Message.create({
           roomId: booking.roomId,
           senderId: driverId,
-          content: formattedChatContent,
+          content: `${prefix}\n${cleanQuery}`,
         });
 
         if (io) {
@@ -292,6 +379,13 @@ router.patch(
         pickupLocation: booking.pickupLocation,
         dropLocation: booking.dropLocation,
         scheduledTime: booking.scheduledTime,
+        scheduledAt: booking.scheduledAt
+          ? booking.scheduledAt.toISOString()
+          : booking.createdAt.toISOString(),
+        estimatedEndAt: booking.estimatedEndAt
+          ? booking.estimatedEndAt.toISOString()
+          : booking.createdAt.toISOString(),
+        durationMinutes: booking.durationMinutes || 60,
         notes: booking.notes || '',
         status: booking.status,
         queryMessage: booking.queryMessage || '',
@@ -308,6 +402,262 @@ router.patch(
     } catch (error) {
       console.error('Error responding to booking:', error);
       res.status(500).json({ error: 'Failed to update booking response.' });
+    }
+  }
+);
+
+// 4. Manager cancels an upcoming ride
+router.patch(
+  '/:bookingId/cancel',
+  verifyToken,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (req.user?.role !== 'manager') {
+        res.status(403).json({ error: 'Only managers can cancel rides.' });
+        return;
+      }
+
+      const managerId = String(req.user.userId);
+      const bookingId = Array.isArray(req.params.bookingId)
+        ? req.params.bookingId[0]
+        : String(req.params.bookingId ?? '');
+
+      if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
+        res.status(400).json({ error: 'Invalid booking ID.' });
+        return;
+      }
+
+      const booking = await Booking.findOne({ _id: bookingId, managerId });
+      if (!booking) {
+        res.status(404).json({ error: 'Ride booking not found.' });
+        return;
+      }
+
+      if (booking.status === 'cancelled') {
+        res.status(400).json({ error: 'Ride is already cancelled.' });
+        return;
+      }
+
+      booking.status = 'cancelled';
+      await booking.save();
+
+      const io = req.app.get('io') as Server | undefined;
+
+      const cancelNotice = await Message.create({
+        roomId: booking.roomId,
+        senderId: managerId,
+        content: `🚫 Ride Cancelled (${booking.passengerName} • ${booking.scheduledTime}): This trip has been cancelled by the manager.`,
+      });
+
+      if (io) {
+        io.to(String(booking.roomId)).emit('receive_message', cancelNotice);
+      }
+
+      const cancelledPayload = {
+        _id: String(booking._id),
+        managerId: String(booking.managerId),
+        driverId: String(booking.driverId),
+        roomId: String(booking.roomId),
+        passengerName: booking.passengerName,
+        passengerPhone: booking.passengerPhone,
+        pickupLocation: booking.pickupLocation,
+        dropLocation: booking.dropLocation,
+        scheduledTime: booking.scheduledTime,
+        scheduledAt: booking.scheduledAt.toISOString(),
+        estimatedEndAt: booking.estimatedEndAt.toISOString(),
+        durationMinutes: booking.durationMinutes || 60,
+        notes: booking.notes || '',
+        status: 'cancelled' as const,
+        queryMessage: booking.queryMessage || '',
+        createdAt: booking.createdAt.toISOString(),
+      };
+
+      if (io) {
+        io.to(`user:${booking.managerId}`).emit('booking_status_updated', cancelledPayload);
+        io.to(`user:${booking.driverId}`).emit('booking_status_updated', cancelledPayload);
+      }
+
+      res.status(200).json(cancelledPayload);
+    } catch (error) {
+      console.error('Error cancelling booking:', error);
+      res.status(500).json({ error: 'Failed to cancel ride.' });
+    }
+  }
+);
+
+// 5. Manager reallocates an upcoming ride to another driver
+router.patch(
+  '/:bookingId/reallocate',
+  verifyToken,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (req.user?.role !== 'manager') {
+        res.status(403).json({ error: 'Only managers can reallocate rides.' });
+        return;
+      }
+
+      const managerId = String(req.user.userId);
+      const managerName = req.user.name || 'Manager';
+      const bookingId = Array.isArray(req.params.bookingId)
+        ? req.params.bookingId[0]
+        : String(req.params.bookingId ?? '');
+      const { newDriverId } = req.body as { newDriverId?: string };
+
+      if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
+        res.status(400).json({ error: 'Invalid booking ID.' });
+        return;
+      }
+
+      if (!newDriverId || !mongoose.Types.ObjectId.isValid(newDriverId)) {
+        res.status(400).json({ error: 'Please select a valid target driver.' });
+        return;
+      }
+
+      const booking = await Booking.findOne({ _id: bookingId, managerId });
+      if (!booking) {
+        res.status(404).json({ error: 'Ride booking not found.' });
+        return;
+      }
+
+      if (booking.status === 'cancelled') {
+        res.status(400).json({ error: 'Cannot reallocate a cancelled ride.' });
+        return;
+      }
+
+      const previousDriverId = String(booking.driverId);
+      const previousRoomId = String(booking.roomId);
+
+      if (previousDriverId === String(newDriverId)) {
+        res.status(400).json({ error: 'Ride is already assigned to this driver.' });
+        return;
+      }
+
+      const targetDriver = await User.findOne({
+        _id: newDriverId,
+        role: 'driver',
+        managerId,
+      });
+
+      if (!targetDriver) {
+        res.status(404).json({ error: 'Target driver not found in your fleet.' });
+        return;
+      }
+
+      // Check cross-timing conflict on the target driver
+      const conflictingBooking = await Booking.findOne({
+        _id: { $ne: booking._id },
+        driverId: targetDriver._id,
+        status: { $in: ['pending', 'confirmed', 'query_raised'] },
+        scheduledAt: { $lt: booking.estimatedEndAt },
+        estimatedEndAt: { $gt: booking.scheduledAt },
+      }).sort({ scheduledAt: 1 });
+
+      if (conflictingBooking) {
+        res.status(409).json({
+          error: `Schedule conflict: ${targetDriver.name} already has a ride for ${conflictingBooking.passengerName} at ${conflictingBooking.scheduledTime}.`,
+        });
+        return;
+      }
+
+      // Find or create personal chat room with the new driver
+      let targetRoom = await Room.findOne({
+        type: 'personal',
+        participants: { $all: [managerId, targetDriver._id] },
+      });
+
+      if (!targetRoom) {
+        targetRoom = await Room.create({
+          type: 'personal',
+          participants: [managerId, targetDriver._id],
+        });
+      }
+
+      booking.driverId = targetDriver._id;
+      booking.roomId = targetRoom._id;
+      booking.status = 'pending';
+      booking.queryMessage = '';
+      await booking.save();
+
+      const io = req.app.get('io') as Server | undefined;
+
+      // Notify previous driver in their chat room
+      const reallocateNotice = await Message.create({
+        roomId: previousRoomId,
+        senderId: managerId,
+        content: `🔄 Ride Reallocated (${booking.passengerName} • ${booking.scheduledTime}): This trip has been reassigned to ${targetDriver.name}.`,
+      });
+
+      if (io) {
+        io.to(previousRoomId).emit('receive_message', reallocateNotice);
+      }
+
+      const reallocatedPayload = {
+        _id: String(booking._id),
+        managerId,
+        managerName,
+        driverId: String(targetDriver._id),
+        driverName: targetDriver.name,
+        roomId: String(targetRoom._id),
+        passengerName: booking.passengerName,
+        passengerPhone: booking.passengerPhone,
+        pickupLocation: booking.pickupLocation,
+        dropLocation: booking.dropLocation,
+        scheduledTime: booking.scheduledTime,
+        scheduledAt: booking.scheduledAt.toISOString(),
+        estimatedEndAt: booking.estimatedEndAt.toISOString(),
+        durationMinutes: booking.durationMinutes || 60,
+        notes: booking.notes || '',
+        status: booking.status,
+        queryMessage: '',
+        createdAt: booking.createdAt.toISOString(),
+      };
+
+      if (io) {
+        // Remove from previous driver & update manager
+        io.to(`user:${previousDriverId}`).emit('booking_reallocated', {
+          bookingId: String(booking._id),
+          previousDriverId,
+          booking: reallocatedPayload,
+        });
+        io.to(`user:${managerId}`).emit('booking_reallocated', {
+          bookingId: String(booking._id),
+          previousDriverId,
+          booking: reallocatedPayload,
+        });
+
+        // Dispatch live incoming alert to the newly allocated driver
+        io.to(`user:${targetDriver._id}`).emit('booking_assigned', reallocatedPayload);
+      }
+
+      if (targetDriver.fcmToken) {
+        await sendBookingAlertPush({
+          token: targetDriver.fcmToken,
+          data: {
+            type: 'BOOKING_ASSIGNED',
+            bookingId: reallocatedPayload._id,
+            managerId: reallocatedPayload.managerId,
+            managerName: reallocatedPayload.managerName,
+            driverId: reallocatedPayload.driverId,
+            roomId: reallocatedPayload.roomId,
+            passengerName: reallocatedPayload.passengerName,
+            passengerPhone: reallocatedPayload.passengerPhone,
+            pickupLocation: reallocatedPayload.pickupLocation,
+            dropLocation: reallocatedPayload.dropLocation,
+            scheduledTime: reallocatedPayload.scheduledTime,
+            scheduledAt: reallocatedPayload.scheduledAt,
+            estimatedEndAt: reallocatedPayload.estimatedEndAt,
+            durationMinutes: String(reallocatedPayload.durationMinutes),
+            notes: reallocatedPayload.notes,
+            status: reallocatedPayload.status,
+            createdAt: reallocatedPayload.createdAt,
+          },
+        });
+      }
+
+      res.status(200).json(reallocatedPayload);
+    } catch (error) {
+      console.error('Error reallocating booking:', error);
+      res.status(500).json({ error: 'Failed to reallocate ride.' });
     }
   }
 );
